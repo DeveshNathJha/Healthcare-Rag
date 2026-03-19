@@ -1,0 +1,38 @@
+# ── Core FastAPI Stack ────────────────────────────────────────────────────────
+fastapi
+uvicorn
+python-multipart
+pydantic
+
+# ── Document Processing ───────────────────────────────────────────────────────
+pymupdf          # PyMuPDF: fast digital PDF text extraction
+easyocr          # OCR for scanned/image-based medical documents
+opencv-python-headless   # Image preprocessing (denoise, threshold)
+numpy            # Required by OpenCV and EasyOCR
+openpyxl         # Excel (.xlsx) file reading — required by pandas
+
+# ── Structured Data ───────────────────────────────────────────────────────────
+pandas           # CSV/Excel row-to-sentence conversion
+
+# ── LangChain RAG Stack ───────────────────────────────────────────────────────
+langchain-core         # Core abstractions (Document, Runnable, etc.) — explicit pin
+langchain              # Chain orchestration, retrievers, prompts
+langchain-community    # FAISS vector store integration
+langchain-huggingface  # HuggingFaceEmbeddings (all-MiniLM-L6-v2)
+langchain-groq         # Groq (Llama-3) LLM integration
+langchain-text-splitters  # RecursiveCharacterTextSplitter — explicit pin
+
+# ── Vector Search ─────────────────────────────────────────────────────────────
+faiss-cpu        # FAISS: approximate nearest neighbour search (CPU build)
+
+# ── Reranking ─────────────────────────────────────────────────────────────────
+flashrank         # Fast reranking layer (FlashrankRerank)
+
+# ── Token Counting & Optimization ────────────────────────────────────────────
+tiktoken          # Token counting for context window management
+
+# ── Environment & Config ──────────────────────────────────────────────────────
+python-dotenv    # Load GROQ_API_KEY from .env
+
+# ── Optional: Knowledge Graph Visualisation ───────────────────────────────────
+# pyvis           # Uncomment to visualise metadata-linked knowledge graphs
