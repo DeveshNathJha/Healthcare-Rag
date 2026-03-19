@@ -36,6 +36,7 @@ venv/
 ENV/
 env/
 .env/
+rag-health/
 
 # IDE files
 .vscode/
