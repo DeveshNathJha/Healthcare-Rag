@@ -6,24 +6,24 @@ A production-ready Retrieval-Augmented Generation (RAG) system built for healthc
 
 ## Key Features
 
-### Phase 1 — Core RAG Pipeline
+### Phase 1 - Core RAG Pipeline
 1. **Dual-Layer Ingestion (OCR + Digital)**: Uses PyMuPDF for native text extraction, falls back to EasyOCR (2x/3x DPI adaptive retry) for scanned documents.
 2. **Structured Data Support**: Processes CSV and Excel files via pandas, treating each row as a sentence.
 3. **Small-to-Big Chunking**: Child chunks (400 chars) embedded in FAISS for precision; parent chunks (1500 chars) fed to LLM for rich context.
-4. **Graph-RAG Metadata Linking**: Every chunk carries `source`, `page`, `doc_type`, `ocr_used`, `ingested_at`, `parent_id`, `chunk_index` — enables citations and filtered search.
+4. **Graph-RAG Metadata Linking**: Every chunk carries `source`, `page`, `doc_type`, `ocr_used`, `ingested_at`, `parent_id`, `chunk_index` - enables citations and filtered search.
 5. **FlashRank Reranking**: Cross-encoder reranks FAISS top-10 results by logical relevance before LLM generation.
 6. **Token Optimization**: `tiktoken` counts input + output tokens; `_trim_context_to_token_limit()` prevents Groq context window overflow.
 7. **Toggle / Global Search**: `target_file` parameter restricts FAISS search to a single document (Toggle mode) or all documents (Global mode).
 
-### Phase 2 — Cost & Quality Optimization (NEW)
-8. **LLM-as-Judge Evaluation** (`app/evaluator.py`): After every query, `llama-3-8b-8192` scores the answer on 3 semantic dimensions — no keyword matching, no extra dependencies.
-   - **Faithfulness** — Hallucination detection (does answer use only retrieved context?)
-   - **Answer Relevance** — Is the answer on-topic?
-   - **Context Precision** — Was FAISS retrieval actually useful?
-   - **Composite Grade** — A (≥0.85) / B (≥0.70) / C (≥0.50) / F (<0.50)
-9. **Prompt Cache** (`app/rag_chain.py` — `PromptCache`): SHA-256 keyed in-memory cache with 1-hour TTL. Repeat queries served instantly (0 API calls). Auto-cleared on new document upload.
-10. **Multi-Factor Model Router** (`app/rag_chain.py` — `select_model()`): Routes to `llama-3-8b-8192` (cheap, fast) only when ALL three signals are simple: query ≤12 words, no complex clinical keywords, context ≤3500 tokens. Otherwise routes to `llama-3.3-70b-versatile`.
-11. **Token Budget Tracker** (`app/utils.py` — `TokenBudgetTracker`): Session-level tracking of token usage, model calls, cache hits, and estimated USD cost — visible on `/stats`.
+### Phase 2 - Cost & Quality Optimization (NEW)
+8. **LLM-as-Judge Evaluation** (`app/evaluator.py`): After every query, `llama-3-8b-8192` scores the answer on 3 semantic dimensions - no keyword matching, no extra dependencies.
+   - **Faithfulness** - Hallucination detection (does answer use only retrieved context?)
+   - **Answer Relevance** - Is the answer on-topic?
+   - **Context Precision** - Was FAISS retrieval actually useful?
+   - **Composite Grade** - A (≥0.85) / B (≥0.70) / C (≥0.50) / F (<0.50)
+9. **Prompt Cache** (`app/rag_chain.py` - `PromptCache`): SHA-256 keyed in-memory cache with 1-hour TTL. Repeat queries served instantly (0 API calls). Auto-cleared on new document upload.
+10. **Multi-Factor Model Router** (`app/rag_chain.py` - `select_model()`): Routes to `llama-3-8b-8192` (cheap, fast) only when ALL three signals are simple: query <=12 words, no complex clinical keywords, context <=3500 tokens. Otherwise routes to `llama-3.3-70b-versatile`.
+11. **Token Budget Tracker** (`app/utils.py` - `TokenBudgetTracker`): Session-level tracking of token usage, model calls, cache hits, and estimated USD cost - visible on `/stats`.
 
 ### MLOps
 12. **Structured Logging**: `RotatingFileHandler` (5 MB × 3 backups), `@log_performance` decorator, per-phase latency logging (FAISS / Rerank / LLM / Eval).
@@ -41,29 +41,29 @@ A production-ready Retrieval-Augmented Generation (RAG) system built for healthc
 └──────────────┬──────────────────────────────────┘
                │
        ┌───────▼────────┐
-       │  processor.py  │ ← PyMuPDF + EasyOCR + pandas
+       │  processor.py  │ <- PyMuPDF + EasyOCR + pandas
        │  (Librarian)   │
        └───────┬────────┘
                │ pages_data (text + metadata)
        ┌───────▼────────┐
-       │  rag_chain.py  │ ← FAISS + FlashRank + PromptCache + ModelRouter
+       │  rag_chain.py  │ <- FAISS + FlashRank + PromptCache + ModelRouter
        │  (Researcher)  │
        └───────┬────────┘
                │
        ┌───────▼────────┐
-       │  evaluator.py  │ ← LLM-as-Judge (llama-3-8b-8192, temp=0)
+       │  evaluator.py  │ <- LLM-as-Judge (llama-3-8b-8192, temp=0)
        │  (Evaluator)   │
        └───────┬────────┘
                │ eval_metrics attached to response
        ┌───────▼────────┐
-       │   utils.py     │ ← Logging + TokenBudgetTracker + format_citations
+       │   utils.py     │ <- Logging + TokenBudgetTracker + format_citations
        └────────────────┘
 
 Stack:
   Embedding:   sentence-transformers/all-MiniLM-L6-v2 (384-dim, offline)
   Vector DB:   FAISS (local, CPU)
   Reranker:    FlashRank ms-marco-MiniLM-L-12-v2 (offline)
-  LLM:         Groq API → llama-3-8b-8192 / llama-3.3-70b-versatile
+  LLM:         Groq API -> llama-3-8b-8192 / llama-3.3-70b-versatile
   Framework:   FastAPI + LangChain
 ```
 
@@ -83,7 +83,7 @@ Stack:
    pip install -r requirements.txt
    ```
 
-3. Configure environment variables — create a `.env` file:
+3. Configure environment variables - create a `.env` file:
    ```env
    GROQ_API_KEY=your_groq_api_key_here
    ```
@@ -179,21 +179,6 @@ python test_script.py
 
 ---
 
-## Notes Directory
-
-Detailed technical documentation is available in `notes/`:
-
-| File | Covers |
-|------|--------|
-| `researcher_notes.md` | `rag_chain.py` — Chunking, FAISS, FlashRank, Prompt Engineering, PromptCache, ModelRouter |
-| `evaluator_notes.md` | `evaluator.py` — LLM-as-Judge, 3 metrics, grade system, robust parsing |
-| `data_pipeline_notes.md` | `processor.py` — PyMuPDF, EasyOCR, pandas pipeline |
-| `features_and_tech_stack.md` | Full tech stack overview |
-| `how_to_run.md` | Step-by-step setup guide |
-| `beginner_guide_hinglish.md` | Beginner-friendly explanation (Hinglish) |
-
----
-
 ## Logs & Monitoring
 
 Logs stored in `logs/healthcare_rag.log` with automatic 5 MB rotation (3 backups kept).
@@ -211,10 +196,10 @@ Per-request log includes:
 
 | Signal | Threshold | Light Model (8B) | Heavy Model (70B) |
 |--------|-----------|-----------------|-------------------|
-| Query word count | ≤ 12 words | ✅ | — |
-| Complex keywords | "diagnose", "prognosis", "etiology", "contraindication"... | — | ✅ |
-| Context token count | > 3500 tokens | — | ✅ |
-| **Rule** | ALL three simple | **Use 8B** | **ANY complex → Use 70B** |
+| Query word count | <= 12 words | Yes | - |
+| Complex keywords | "diagnose", "prognosis", "etiology", "contraindication"... | - | Yes |
+| Context token count | > 3500 tokens | - | Yes |
+| **Rule** | ALL three simple | **Use 8B** | **ANY complex -> Use 70B** |
 
 ---
 
