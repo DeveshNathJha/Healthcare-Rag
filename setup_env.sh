@@ -1,6 +1,6 @@
 #!/bin/bash
 echo "Creating virtual environment: rag-dev..."
-python3 -m venv rag-dev
+python3 -m venv rag-health
 
 echo "Activating environment..."
 source rag-dev/bin/activate

@@ -1,28 +1,73 @@
-# Healthcare RAG System 🏥
+# Healthcare RAG System
 
-A production-ready Retrieval-Augmented Generation (RAG) system built for healthcare applications. This system provides context-aware Q&A against healthcare documents (PDF, CSV, Excel), employing advanced ML techniques including Dual-Layer OCR, FlashRank Reranking, Graph-RAG metadata-linking, and Small-to-Big Chunking for high-accuracy semantic search.
+A production-ready Retrieval-Augmented Generation (RAG) system built for healthcare applications. This system provides context-aware Q&A against healthcare documents (PDF, CSV, Excel), employing advanced ML techniques including Dual-Layer OCR, FlashRank Reranking, Graph-RAG metadata-linking, Small-to-Big Chunking, LLM-as-Judge Evaluation, Prompt Caching, and Multi-Factor Model Routing.
+
+---
 
 ## Key Features
 
-1. **Dual-Layer Ingestion (OCR + Digital)**: Uses PyMuPDF for native text and gracefully falls back to EasyOCR for scanned documents or images.
-2. **Robust Structured Data Support**: Processes CSV and Excel files by chunking meaningful rows to extract tabular insights.
-3. **Advanced RAG Pipeline**:
-   - **FlashRank Reranking**: Boosts hit relevance using cross-encoder reranking.
-   - **Small-to-Big Chunking**: Employs an intelligent parent-child chunking strategy (indexing fine-grained chunks but providing broader parent context to the LLM) for optimal semantic retrieval.
-   - **Graph-RAG Metadata Linking**: Attaches rich metadata (page numbers, token stats, timing) to track data provenance across ingestion.
-4. **Token Optimization & Cost Control**: Monitors API tokens for LLM interactions and gracefully trims oversized contexts.
-5. **Interactive Search Modes**:
-   - **Global Search**: Queries the entire document FAISS index.
-   - **Toggle Search**: Filters the FAISS index to target queries to specific documents.
-6. **MLOps Best Practices**: Comprehensive logging via `RotatingFileHandler`, execution metrics, API tracing, error handling overrides, and a dedicated `/stats` endpoint for system monitoring.
+### Phase 1 — Core RAG Pipeline
+1. **Dual-Layer Ingestion (OCR + Digital)**: Uses PyMuPDF for native text extraction, falls back to EasyOCR (2x/3x DPI adaptive retry) for scanned documents.
+2. **Structured Data Support**: Processes CSV and Excel files via pandas, treating each row as a sentence.
+3. **Small-to-Big Chunking**: Child chunks (400 chars) embedded in FAISS for precision; parent chunks (1500 chars) fed to LLM for rich context.
+4. **Graph-RAG Metadata Linking**: Every chunk carries `source`, `page`, `doc_type`, `ocr_used`, `ingested_at`, `parent_id`, `chunk_index` — enables citations and filtered search.
+5. **FlashRank Reranking**: Cross-encoder reranks FAISS top-10 results by logical relevance before LLM generation.
+6. **Token Optimization**: `tiktoken` counts input + output tokens; `_trim_context_to_token_limit()` prevents Groq context window overflow.
+7. **Toggle / Global Search**: `target_file` parameter restricts FAISS search to a single document (Toggle mode) or all documents (Global mode).
+
+### Phase 2 — Cost & Quality Optimization (NEW)
+8. **LLM-as-Judge Evaluation** (`app/evaluator.py`): After every query, `llama-3-8b-8192` scores the answer on 3 semantic dimensions — no keyword matching, no extra dependencies.
+   - **Faithfulness** — Hallucination detection (does answer use only retrieved context?)
+   - **Answer Relevance** — Is the answer on-topic?
+   - **Context Precision** — Was FAISS retrieval actually useful?
+   - **Composite Grade** — A (≥0.85) / B (≥0.70) / C (≥0.50) / F (<0.50)
+9. **Prompt Cache** (`app/rag_chain.py` — `PromptCache`): SHA-256 keyed in-memory cache with 1-hour TTL. Repeat queries served instantly (0 API calls). Auto-cleared on new document upload.
+10. **Multi-Factor Model Router** (`app/rag_chain.py` — `select_model()`): Routes to `llama-3-8b-8192` (cheap, fast) only when ALL three signals are simple: query ≤12 words, no complex clinical keywords, context ≤3500 tokens. Otherwise routes to `llama-3.3-70b-versatile`.
+11. **Token Budget Tracker** (`app/utils.py` — `TokenBudgetTracker`): Session-level tracking of token usage, model calls, cache hits, and estimated USD cost — visible on `/stats`.
+
+### MLOps
+12. **Structured Logging**: `RotatingFileHandler` (5 MB × 3 backups), `@log_performance` decorator, per-phase latency logging (FAISS / Rerank / LLM / Eval).
+13. **Thread Safety**: `threading.Lock()` on all FAISS read/write operations.
+14. **File Validation**: 50 MB upload limit enforced at API layer.
+
+---
 
 ## Architecture
 
-* **Framework**: FastAPI
-* **Embedding Model**: FastEmbed / BGE
-* **Vector Store**: FAISS
-* **LLM**: Llama-3 (via Groq API)
-* **Metadata Splitting**: LangChain text splitters
+```
+┌─────────────────────────────────────────────────┐
+│                  FastAPI (main.py)               │
+│  /upload  /query  /list-files  /stats  /delete  │
+└──────────────┬──────────────────────────────────┘
+               │
+       ┌───────▼────────┐
+       │  processor.py  │ ← PyMuPDF + EasyOCR + pandas
+       │  (Librarian)   │
+       └───────┬────────┘
+               │ pages_data (text + metadata)
+       ┌───────▼────────┐
+       │  rag_chain.py  │ ← FAISS + FlashRank + PromptCache + ModelRouter
+       │  (Researcher)  │
+       └───────┬────────┘
+               │
+       ┌───────▼────────┐
+       │  evaluator.py  │ ← LLM-as-Judge (llama-3-8b-8192, temp=0)
+       │  (Evaluator)   │
+       └───────┬────────┘
+               │ eval_metrics attached to response
+       ┌───────▼────────┐
+       │   utils.py     │ ← Logging + TokenBudgetTracker + format_citations
+       └────────────────┘
+
+Stack:
+  Embedding:   sentence-transformers/all-MiniLM-L6-v2 (384-dim, offline)
+  Vector DB:   FAISS (local, CPU)
+  Reranker:    FlashRank ms-marco-MiniLM-L-12-v2 (offline)
+  LLM:         Groq API → llama-3-8b-8192 / llama-3.3-70b-versatile
+  Framework:   FastAPI + LangChain
+```
+
+---
 
 ## Installation
 
@@ -31,51 +76,152 @@ A production-ready Retrieval-Augmented Generation (RAG) system built for healthc
    cd healthcare_rag
    ```
 
-2. Create a virtual environment (recommended) and install the dependencies:
+2. Create a virtual environment and install dependencies:
    ```bash
    python -m venv .venv
-   source .venv/bin/activate  # On Linux/Mac
+   source .venv/bin/activate
    pip install -r requirements.txt
    ```
 
-3. Configure Environment Variables:
-   Create a `.env` file in the root directory and add your Groq API key:
+3. Configure environment variables — create a `.env` file:
    ```env
    GROQ_API_KEY=your_groq_api_key_here
    ```
+
+4. Pre-cache models (required for offline/restricted environments):
+   ```bash
+   # HuggingFace embedding model
+   python -c "from langchain_huggingface import HuggingFaceEmbeddings; HuggingFaceEmbeddings(model_name='sentence-transformers/all-MiniLM-L6-v2')"
+   # FlashRank reranker
+   python -c "from langchain_community.document_compressors import FlashrankRerank; FlashrankRerank()"
+   ```
+
+---
 
 ## Usage
 
 ### Starting the Server
 
-Launch the FastAPI application using Uvicorn:
-
 ```bash
 uvicorn app.main:app --reload
 ```
-The server will start on `http://localhost:8000`.
 
-### Interacting with the API
+Server starts on `http://localhost:8000`. Swagger UI: `http://localhost:8000/docs`.
 
-You can use the built-in Swagger UI at `http://localhost:8000/docs` to test endpoints, or verify functionality using the existing `test_script.py`.
+### API Endpoints
 
-* **`POST /upload`**: Upload PDF, CSV, or Excel files. Returns parsing statistics.
-* **`POST /query`**: Pass `{"question": "..."}` or `{"question": "...", "target_file": "..."}` to run context-aware Q&A.
-* **`GET /list-files`**: Retrieve a list of all currently indexed documents.
-* **`GET /stats`**: View MLOps metrics (upload counts, FAISS index size, system health).
-* **`DELETE /delete-document`**: Safely remove documents from local disk tracking.
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/upload` | Upload PDF, CSV, or Excel. Returns chunk stats. Cache cleared automatically. |
+| `POST` | `/query` | Ask a question. Returns answer + eval_metrics + cache_hit + model_used. |
+| `GET`  | `/list-files` | List all indexed documents. |
+| `GET`  | `/stats` | System health + token budget dashboard. |
+| `DELETE` | `/delete-document/{filename}` | Remove a document from disk. |
+
+### /query Request & Response
+
+**Request:**
+```json
+{
+  "question": "What are the symptoms of Type 2 Diabetes?",
+  "target_file": null
+}
+```
+
+**Response (Phase 2 format):**
+```json
+{
+  "answer": "Type 2 Diabetes symptoms include increased thirst...",
+  "tokens_input": 1240,
+  "tokens_output": 187,
+  "confidence": "High (FlashRank Reranked + Small-to-Big)",
+  "sources": [{"source": "diabetes_guide.pdf", "page": 3, "doc_type": "pdf"}],
+  "cache_hit": false,
+  "model_used": "llama-3-8b-8192",
+  "eval_metrics": {
+    "faithfulness": 0.91,
+    "answer_relevance": 0.88,
+    "context_precision": 0.80,
+    "eval_grade": "A",
+    "judge_model": "llama-3-8b-8192",
+    "eval_latency_ms": 340
+  }
+}
+```
+
+### /stats Response (Token Budget)
+
+```json
+{
+  "upload_count": 3,
+  "index_size_mb": 2.4,
+  "index_exists": true,
+  "log_file": "logs/healthcare_rag.log",
+  "token_budget": {
+    "total_queries": 47,
+    "api_calls_made": 35,
+    "cache_hits": 12,
+    "cache_hit_rate_pct": 25.5,
+    "total_input_tokens": 58420,
+    "total_output_tokens": 9110,
+    "model_8b_calls": 30,
+    "model_70b_calls": 5,
+    "estimated_cost_usd": 0.0038
+  }
+}
+```
 
 ### Running Tests
-
-Execute the comprehensive test script to ensure systems are running smoothly:
 
 ```bash
 python test_script.py
 ```
 
+---
+
+## Notes Directory
+
+Detailed technical documentation is available in `notes/`:
+
+| File | Covers |
+|------|--------|
+| `researcher_notes.md` | `rag_chain.py` — Chunking, FAISS, FlashRank, Prompt Engineering, PromptCache, ModelRouter |
+| `evaluator_notes.md` | `evaluator.py` — LLM-as-Judge, 3 metrics, grade system, robust parsing |
+| `data_pipeline_notes.md` | `processor.py` — PyMuPDF, EasyOCR, pandas pipeline |
+| `features_and_tech_stack.md` | Full tech stack overview |
+| `how_to_run.md` | Step-by-step setup guide |
+| `beginner_guide_hinglish.md` | Beginner-friendly explanation (Hinglish) |
+
+---
+
 ## Logs & Monitoring
 
-Logs are generated with automatic rolling over at 5MB limits and are stored in:
-`logs/healthcare_rag.log`
+Logs stored in `logs/healthcare_rag.log` with automatic 5 MB rotation (3 backups kept).
 
-This tracking includes individual function latency tracking, LLM input/output token counts, and FAISS insertion speeds.
+Per-request log includes:
+- Phase-wise latency: FAISS / FlashRank / LLM / Evaluator
+- Token counts (input + output)
+- Model selected by router
+- Cache hit/miss
+- Eval grade
+
+---
+
+## Model Router Reference
+
+| Signal | Threshold | Light Model (8B) | Heavy Model (70B) |
+|--------|-----------|-----------------|-------------------|
+| Query word count | ≤ 12 words | ✅ | — |
+| Complex keywords | "diagnose", "prognosis", "etiology", "contraindication"... | — | ✅ |
+| Context token count | > 3500 tokens | — | ✅ |
+| **Rule** | ALL three simple | **Use 8B** | **ANY complex → Use 70B** |
+
+---
+
+## Cost Reference (Groq API, ~2025)
+
+| Model | Per 1M Tokens | Typical Query Cost |
+|-------|--------------|-------------------|
+| `llama-3-8b-8192` | $0.05 | ~$0.00006 |
+| `llama-3.3-70b-versatile` | $0.59 | ~$0.00073 |
+| Judge eval call (8B) | $0.05 | ~$0.000025 |

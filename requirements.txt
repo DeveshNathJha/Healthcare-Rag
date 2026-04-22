@@ -10,6 +10,7 @@ easyocr          # OCR for scanned/image-based medical documents
 opencv-python-headless   # Image preprocessing (denoise, threshold)
 numpy            # Required by OpenCV and EasyOCR
 openpyxl         # Excel (.xlsx) file reading — required by pandas
+img2table        # Table extraction from PDFs to Excel
 
 # ── Structured Data ───────────────────────────────────────────────────────────
 pandas           # CSV/Excel row-to-sentence conversion

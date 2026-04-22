@@ -51,14 +51,16 @@ import time
 import shutil
 from typing import Optional, List
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request, BackgroundTasks
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, validator
 from starlette.middleware.base import BaseHTTPMiddleware
+import uuid
 
 from app.processor import DocumentProcessor, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB
-from app.rag_chain import RAGChain
-from app.utils import get_logger, ensure_dirs, get_system_stats
+from app.rag_chain import RAGChain, prompt_cache
+from app.utils import get_logger, ensure_dirs, get_system_stats, token_budget
+from app.services.table_extractor import convert_pdf_to_excel, validate_with_llm
 
 logger = get_logger(__name__)
 
@@ -120,13 +122,17 @@ class QueryRequest(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    question:        str
-    answer:          str
-    tokens_input:    int   # New: context + query tokens (cost tracking)
-    tokens_output:   int   # Was 'tokens_used' — now split for clarity
-    search_mode:     str
+    question:         str
+    answer:           str
+    tokens_input:     int   # Input token count (query + context)
+    tokens_output:    int   # Output token count (generated answer)
+    search_mode:      str
     confidence_level: str
-    sources:         List[dict]   # Full metadata list for frontend citations
+    sources:          List[dict]   # Full metadata list for frontend citations
+    # ── New fields ───────────────────────────────────────────────────────────────
+    cache_hit:        bool         # True = served from in-memory cache (0 API calls)
+    model_used:       Optional[str]  # Which Groq model was selected by ModelRouter
+    eval_metrics:     Optional[dict]  # LLM-as-Judge scores (faithfulness, relevance, precision)
 
 
 # ── ENDPOINTS ─────────────────────────────────────────────────────────────────
@@ -180,6 +186,11 @@ async def upload_document(file: UploadFile = File(...)):
 
         # Index into FAISS with Graph-RAG metadata (Small-to-Big chunking)
         rag.create_vector_store(pages_data, file.filename)
+
+        # ── Cache Invalidation: New document = stale answers ─────────────────
+        # WHY: If a doctor uploads an updated protocol, old cached answers
+        # for the same question would be wrong. Clear all cached responses.
+        prompt_cache.clear()
 
         elapsed_sec = round(time.perf_counter() - t_start, 2)
         total_chars = sum(p["metadata"].get("char_count", 0) for p in pages_data)
@@ -239,28 +250,37 @@ async def query_document(request: QueryRequest):
       - Returns sources list (metadata dicts) for frontend citation rendering
       - Checks for LLM error in result dict (vs just checking if result is str)
     """
-    result = rag.get_response(request.question, request.target_file)
+    try:
+        result = rag.get_response(request.question, request.target_file)
 
-    # Detect error responses from rag_chain (e.g. empty DB, LLM timeout)
-    if result.get("confidence") in ("N/A", "Error"):
-        status = 404 if result["confidence"] == "N/A" else 503
-        raise HTTPException(status_code=status, detail=result["answer"])
+        # Detect error responses from rag_chain (e.g. empty DB, LLM timeout)
+        if result.get("confidence") in ("N/A", "Error"):
+            status = 404 if result["confidence"] == "N/A" else 503
+            raise HTTPException(status_code=status, detail=result["answer"])
 
-    mode = (
-        f"Filtered Search → {request.target_file}"
-        if request.target_file
-        else "Global Hybrid Search (all documents)"
-    )
+        mode = (
+            f"Filtered Search → {request.target_file}"
+            if request.target_file
+            else "Global Hybrid Search (all documents)"
+        )
 
-    return {
-        "question":        request.question,
-        "answer":          result["answer"],
-        "tokens_input":    result["tokens_input"],
-        "tokens_output":   result["tokens_output"],
-        "search_mode":     mode,
-        "confidence_level": result["confidence"],
-        "sources":         result["sources"]
-    }
+        return {
+            "question":         request.question,
+            "answer":           result["answer"],
+            "tokens_input":     result["tokens_input"],
+            "tokens_output":    result["tokens_output"],
+            "search_mode":      mode,
+            "confidence_level": result["confidence"],
+            "sources":          result["sources"],
+            "cache_hit":        result.get("cache_hit", False),
+            "model_used":       result.get("model_used"),
+            "eval_metrics":     result.get("eval_metrics")
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[QUERY ERROR] Unexpected failure: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
 
 
 @app.get("/stats")
@@ -273,6 +293,9 @@ async def system_stats():
     NEW endpoint — not in original.
     """
     stats = get_system_stats(UPLOAD_DIR, INDEX_PATH)
+    # Augment with token budget + cache stats
+    stats["token_budget"]  = token_budget.get_budget_summary()
+    stats["prompt_cache"]  = prompt_cache.stats()
     logger.info(f"[STATS] Polled: {stats}")
     return stats
 
@@ -313,6 +336,80 @@ async def delete_document(filename: str = Query(..., description="Exact filename
         raise HTTPException(status_code=500, detail=f"Deletion failed: {str(e)}")
 
 
+def remove_file(path: str):
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception as e:
+            logger.warning(f"Failed to delete temp file {path}: {e}")
+
+
+@app.post("/extract-excel")
+async def extract_to_excel(
+    file: UploadFile = File(...),
+    use_llm_validation: bool = Query(False, description="Use Llama-3 to structure and validate raw OCR tables into clean columns.")
+):
+    """
+    Extracts tabular data from a PDF (digital or scanned) and returns an Excel file.
+    Bypasses the FAISS semantic search pipeline.
+    """
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    if file_ext != ".pdf":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only PDF files are supported for table extraction. Got: '{file_ext}'"
+        )
+
+    # Read file to check size
+    file_bytes = await file.read()
+    if len(file_bytes) > MAX_FILE_SIZE_BYTES:
+        size_mb = len(file_bytes) / (1024 * 1024)
+        raise HTTPException(
+            status_code=400,
+            detail=f"File '{file.filename}' is {size_mb:.1f} MB, exceeding {MAX_FILE_SIZE_MB} MB limit."
+        )
+
+    temp_id = str(uuid.uuid4())
+    temp_pdf_path = f"/tmp/{temp_id}_{file.filename}"
+    temp_excel_path = f"/tmp/{temp_id}_output.xlsx"
+
+    with open(temp_pdf_path, "wb") as f:
+        f.write(file_bytes)
+
+    logger.info(f"[EXTRACT-EXCEL] Processing '{file.filename}' (LLM Validation: {use_llm_validation})")
+
+    t_start = time.perf_counter()
+    try:
+        if use_llm_validation:
+            validate_with_llm(temp_pdf_path, temp_excel_path)
+        else:
+            convert_pdf_to_excel(temp_pdf_path, temp_excel_path)
+    except ValueError as ve:
+        remove_file(temp_pdf_path)
+        raise HTTPException(status_code=422, detail=str(ve))
+    except Exception as e:
+        remove_file(temp_pdf_path)
+        logger.error(f"[EXTRACT ERROR] '{file.filename}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
+
+    elapsed_sec = time.perf_counter() - t_start
+    logger.info(f"[EXTRACT-EXCEL DONE] '{file.filename}' processed in {elapsed_sec:.1f}s.")
+
+    # Clean up the PDF immediately
+    remove_file(temp_pdf_path)
+
+    # Return Excel and clean it up as a background task
+    tasks = BackgroundTasks()
+    tasks.add_task(remove_file, temp_excel_path)
+
+    return FileResponse(
+        path=temp_excel_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"Extracted_{file.filename.replace('.pdf', '')}.xlsx",
+        background=tasks
+    )
+
+
 @app.get("/")
 async def health_check():
     """
@@ -321,7 +418,7 @@ async def health_check():
     return {
         "status":   "Online",
         "system":   "Healthcare Intelligence",
-        "version":  "3.0.0",
+        "version":  "4.0.0",
         "features": [
             "Dual-Layer-OCR",
             "Structured-Data-Support",
@@ -330,6 +427,10 @@ async def health_check():
             "Small-to-Big-Chunking",
             "Graph-RAG-Metadata",
             "Token-Optimization",
-            "MLOps-Logging"
+            "MLOps-Logging",
+            "Prompt-Caching-SHA256-TTL",
+            "Multi-Factor-Model-Router",
+            "LLM-as-Judge-Evaluation",
+            "Token-Budget-Tracker"
         ]
     }

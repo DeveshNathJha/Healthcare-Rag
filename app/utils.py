@@ -16,6 +16,10 @@ CHANGES MADE vs ORIGINAL:
   3. get_system_stats() — Provides a JSON-ready dict of FAISS index size on disk +
      upload directory document count. Powers the new /stats endpoint in main.py.
   4. format_citations() — Enhanced to include page numbers if available in metadata.
+  5. TokenBudgetTracker (NEW) — Session-level token usage and cost tracking.
+     Records per-query token counts, model used, and cache hits. Computes
+     estimated USD cost using Groq API pricing for 8B and 70B models.
+     Powers the token_budget section of the /stats endpoint.
 
 STRICTLY PRESERVED:
   - ensure_dirs()  ✅
@@ -230,3 +234,115 @@ def get_system_stats(upload_dir: str, index_path: str) -> dict:
         "index_exists": index_exists,
         "log_file": os.path.join(LOGS_DIR, "healthcare_rag.log")
     }
+
+
+# ── TOKEN BUDGET TRACKER ────────────────────────────────────────────────────────────
+# Groq API pricing (as of mid-2025, per 1M tokens, input+output combined)
+# Source: console.groq.com/docs/openai
+# WHY track costs: JD explicitly mentions "cost & latency optimisation".
+# Having per-session USD estimates is a concrete, measurable outcome.
+GROQ_PRICE_PER_1M = {
+    "llama-3-8b-8192":         0.05,   # $0.05 per 1M tokens
+    "llama-3.3-70b-versatile": 0.59,   # $0.59 per 1M tokens
+}
+
+
+class TokenBudgetTracker:
+    """
+    Session-level token usage and cost tracker.
+
+    WHY session-level (not persistent):
+      Persisting to DB/file adds complexity not justified for a demo system.
+      Session stats reset on server restart but clearly show the concept:
+      tracking + optimising token spend — which is what the JD asks for.
+
+    WHY estimated cost:
+      Groq's API is billed per token. Knowing which queries are expensive helps
+      teams decide when to upgrade models or optimise prompts. This data feeds
+      the /stats endpoint for dashboard display.
+    """
+
+    def __init__(self):
+        self._lock = __import__("threading").Lock()
+        self._reset()
+
+    def _reset(self):
+        """Internal state initialiser — called at startup."""
+        self.total_queries      = 0
+        self.total_input_tokens = 0
+        self.total_output_tokens= 0
+        self.cache_hits         = 0
+        self.model_8b_calls     = 0
+        self.model_70b_calls    = 0
+        self.estimated_cost_usd = 0.0
+
+    def record_query(
+        self,
+        tokens_input:  int,
+        tokens_output: int,
+        model_used:    str,
+        cache_hit:     bool = False
+    ):
+        """
+        Records stats for a single query execution.
+
+        PARAMETERS:
+          tokens_input  : Input token count (query + context)
+          tokens_output : Output token count (generated answer)
+          model_used    : Model name string (MODEL_LIGHT or MODEL_HEAVY)
+          cache_hit     : True if served from cache (no API call made)
+        """
+        with self._lock:
+            self.total_queries += 1
+
+            if cache_hit:
+                # Cache hits don't consume tokens or incur API cost
+                self.cache_hits += 1
+                return
+
+            # Track token consumption
+            self.total_input_tokens  += tokens_input
+            self.total_output_tokens += tokens_output
+
+            # Track model usage
+            if "8b" in model_used.lower():
+                self.model_8b_calls += 1
+            else:
+                self.model_70b_calls += 1
+
+            # Estimate cost in USD
+            price_per_1m = GROQ_PRICE_PER_1M.get(model_used, 0.59)  # Default to 70B price
+            total_tokens = tokens_input + tokens_output
+            self.estimated_cost_usd += round(
+                (total_tokens / 1_000_000) * price_per_1m, 6
+            )
+
+    def get_budget_summary(self) -> dict:
+        """
+        Returns a JSON-ready summary of session token usage and estimated cost.
+        Powers the token_budget section of the /stats endpoint.
+        """
+        with self._lock:
+            cache_rate = (
+                round(self.cache_hits / self.total_queries * 100, 1)
+                if self.total_queries > 0 else 0.0
+            )
+            api_calls = self.model_8b_calls + self.model_70b_calls
+            return {
+                "total_queries":       self.total_queries,
+                "api_calls_made":      api_calls,             # Excludes cache hits
+                "cache_hits":          self.cache_hits,
+                "cache_hit_rate_pct":  cache_rate,
+                "total_input_tokens":  self.total_input_tokens,
+                "total_output_tokens": self.total_output_tokens,
+                "model_8b_calls":      self.model_8b_calls,
+                "model_70b_calls":     self.model_70b_calls,
+                "estimated_cost_usd":  round(self.estimated_cost_usd, 6)
+            }
+
+
+# ── MODULE-LEVEL SINGLETON ────────────────────────────────────────────────────
+# WHY module-level: utils.py is imported by both rag_chain.py and main.py.
+# Module-level singleton ensures they all share the SAME tracker instance,
+# giving a unified view of all session stats without any coordination code.
+token_budget = TokenBudgetTracker()
