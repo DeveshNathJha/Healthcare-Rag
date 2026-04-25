@@ -210,3 +210,135 @@ Per-request log includes:
 | `llama-3-8b-8192` | $0.05 | ~$0.00006 |
 | `llama-3.3-70b-versatile` | $0.59 | ~$0.00073 |
 | Judge eval call (8B) | $0.05 | ~$0.000025 |
+
+---
+
+## Cloud Scalability & Azure Deployment
+
+While the current system is optimized for **on-premise inference** to ensure medical data privacy (FAISS runs locally, no PHI leaves the server), the architecture is **fully Dockerized and Azure-ready** for enterprise-scale deployment.
+
+### Current State (On-Premise / Local)
+
+| Component | Current Implementation | Rationale |
+|-----------|----------------------|-----------|
+| Vector DB | FAISS (local, CPU) | Zero cost, complete data privacy, offline-capable |
+| File Storage | Local `uploads/` directory | No cloud dependency for dev/test |
+| Compute | Local Python process | Development and testing environment |
+| LLM Inference | Groq API (external) | 800+ tokens/sec, low latency |
+| Embeddings | `all-MiniLM-L6-v2` (local) | Fully offline after first download |
+
+### Azure Cloud Roadmap
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     CLIENT LAYER                                │
+│              (Web UI / REST Clients / Swagger)                  │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ HTTPS
+┌──────────────────────────▼──────────────────────────────────────┐
+│              Azure App Service / Azure Container Instances       │
+│                   FastAPI Backend (Dockerized)                  │
+│         /upload  /query  /list-files  /stats  /delete           │
+└────┬──────────────────┬───────────────────┬─────────────────────┘
+     │                  │                   │
+┌────▼────┐    ┌────────▼────────┐   ┌──────▼──────────────────┐
+│  Azure  │    │  Azure AI Search │   │  Azure Key Vault        │
+│  Blob   │    │  (Vector Search) │   │  (GROQ_API_KEY, secrets)│
+│ Storage │    │  Replaces FAISS  │   └─────────────────────────┘
+│ (PDFs)  │    │  at million-doc  │
+└─────────┘    │  scale           │
+               └──────────────────┘
+                        │
+               ┌────────▼────────┐
+               │   Groq LPU API  │
+               │  (LLM Inference)│
+               │  llama-3 8B/70B │
+               └─────────────────┘
+```
+
+**Migration path — 3 steps:**
+
+**Step 1 — Data Layer: Azure Blob Storage**
+```bash
+# Replace local uploads/ with Azure Blob
+pip install azure-storage-blob
+# AZURE_STORAGE_CONNECTION_STRING set in Azure Key Vault
+```
+- PDFs uploaded to Blob container `healthcare-docs`
+- FAISS index persisted to Blob (`data/vector_store/` → Blob)
+- Enables multi-instance file access (horizontal scaling)
+
+**Step 2 — Compute: Docker + Azure Container Instances**
+```dockerfile
+# Dockerfile (already structured for containerization)
+FROM python:3.10-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY . .
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+```bash
+# Deploy to Azure Container Instances
+az container create \
+  --resource-group healthcare-rg \
+  --name healthcare-rag-api \
+  --image devesh/healthcare-rag:latest \
+  --ports 8000 \
+  --environment-variables GROQ_API_KEY=@keyvault
+```
+
+**Step 3 — Vector Search: Azure AI Search (at million-doc scale)**
+
+| Scale | Solution | Reason |
+|-------|----------|--------|
+| < 100K docs | FAISS (local) | Zero cost, fast, sufficient |
+| 100K – 1M docs | FAISS on persistent Azure Disk | Scale without architecture change |
+| > 1M docs | Azure AI Search | Managed distributed vector search, native filtering, RBAC |
+
+```python
+# Swap in rag_chain.py — single interface change
+# Current:
+self.vector_store = FAISS.load_local(index_path, self.embeddings)
+
+# Azure AI Search migration:
+from langchain_community.vectorstores import AzureSearch
+self.vector_store = AzureSearch(
+    azure_search_endpoint=os.getenv("AZURE_SEARCH_ENDPOINT"),
+    azure_search_key=os.getenv("AZURE_SEARCH_KEY"),
+    index_name="healthcare-vectors",
+    embedding_function=self.embeddings.embed_query,
+)
+# All downstream code (similarity_search, filter) remains unchanged
+# LangChain abstracts the vector store interface
+```
+
+### Security in Azure Deployment
+
+| Concern | Azure Solution |
+|---------|---------------|
+| API Key management | Azure Key Vault — no hardcoded secrets |
+| Network security | Azure Virtual Network + Private Endpoints |
+| Data encryption | Azure Blob Storage encryption at rest (AES-256) |
+| Access control | Azure RBAC + Managed Identity |
+| HIPAA compliance | Azure HIPAA BAA available for healthcare workloads |
+
+### Docker Quickstart (Current — Ready to Deploy)
+
+```bash
+# Build image
+docker build -t healthcare-rag .
+
+# Run locally
+docker run -p 8000:8000 \
+  -e GROQ_API_KEY=your_key \
+  -v $(pwd)/data:/app/data \
+  healthcare-rag
+
+# Push to Azure Container Registry
+az acr build --registry healthcareragacr \
+  --image healthcare-rag:v1 .
+```
+
+> **Design principle:** All cloud components (Blob Storage, Azure AI Search, Key Vault) are accessed through environment variables and LangChain's abstract vector store interface. This means the same codebase runs locally for development and on Azure for production — **zero code change required for deployment**.
