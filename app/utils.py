@@ -22,9 +22,9 @@ CHANGES MADE vs ORIGINAL:
      Powers the token_budget section of the /stats endpoint.
 
 STRICTLY PRESERVED:
-  - ensure_dirs()  ✅
-  - clear_uploads() ✅
-  - format_citations() ✅ (signature unchanged, output enriched)
+  - ensure_dirs()  
+  - clear_uploads() 
+  - format_citations()  (signature unchanged, output enriched)
 """
 
 import os

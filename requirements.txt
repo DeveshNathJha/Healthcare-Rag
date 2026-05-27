@@ -1,3 +1,9 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# ── Core PyTorch (CPU Only) ───────────────────────────────────────────────────
+torch
+torchvision
+
 # ── Core FastAPI Stack ────────────────────────────────────────────────────────
 fastapi
 uvicorn
@@ -20,6 +26,7 @@ langchain-core         # Core abstractions (Document, Runnable, etc.) — explic
 langchain              # Chain orchestration, retrievers, prompts
 langchain-community    # FAISS vector store integration
 langchain-huggingface  # HuggingFaceEmbeddings (all-MiniLM-L6-v2)
+sentence-transformers  # Required by HuggingFaceEmbeddings
 langchain-groq         # Groq (Llama-3) LLM integration
 langchain-text-splitters  # RecursiveCharacterTextSplitter — explicit pin
 

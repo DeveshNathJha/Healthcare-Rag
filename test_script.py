@@ -7,9 +7,7 @@ BASE_URL = "http://127.0.0.1:8000"
 
 # Filenames from your uploaded image
 FILES_TO_TEST = [
-    "Guideline WHO Guidelines for malaria.pdf",
-    "MSample Written History and Physical Examination.doc - UMNwriteup.pdf",
-    "Sample-filled-in-MR.pdf"
+    "Sample Small.pdf"
 ]
 
 def upload_files():
@@ -68,25 +66,14 @@ if __name__ == "__main__":
     indexed_files = list_indexed_files()
     
     if indexed_files:
-        # 3. Test Global Search (Toggle OFF)
-        # Pooch raha hai malaria ke baare mein (Ye WHO Guidelines se aayega)
-        ask_question("What are the recommended treatments for malaria mentioned in the guidelines?")
+        # 3. Test Global Search
+        ask_question("Summarize the content of the Sample document.")
 
-        # 4. Test Specific Search (Toggle ON)
-        # Pooch raha hai patient history (Ye UMNwriteup file se aayega)
-        specific_file = "MSample Written History and Physical Examination.doc - UMNwriteup.pdf"
-        if specific_file in indexed_files:
+        # 4. Test Specific Search
+        if "Sample Small.pdf" in indexed_files:
             ask_question(
-                "What is the patient's chief complaint?", 
-                target_file=specific_file
-            )
-        
-        # 5. Test another Specific Search (Toggle ON)
-        mr_file = "Sample-filled-in-MR.pdf"
-        if mr_file in indexed_files:
-            ask_question(
-                "Summarize the clinical findings in this medical record.", 
-                target_file=mr_file
+                "What are the main topics discussed in this file?", 
+                target_file="Sample Small.pdf"
             )
     else:
         print("No files found to query. Make sure files are in the same folder as this script.")

@@ -35,11 +35,11 @@ CHANGES MADE vs ORIGINAL:
   6. @log_performance decorator applied to extract_text() for overall timing.
 
 STRICTLY PRESERVED:
-  - preprocess_image() with OpenCV pipeline ✅
-  - process_structured_data() with row-to-sentence logic ✅
-  - save_temp_file() ✅
-  - EasyOCR with gpu=False ✅
-  - Dual-layer OCR: digital text first, OCR fallback if blank ✅
+  - preprocess_image() with OpenCV pipeline 
+  - process_structured_data() with row-to-sentence logic 
+  - save_temp_file() 
+  - EasyOCR with gpu=False 
+  - Dual-layer OCR: digital text first, OCR fallback if blank 
 """
 
 import os
@@ -49,7 +49,7 @@ import cv2
 import numpy as np
 import easyocr
 import pandas as pd   # Structured data (CSV/Excel)
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from app.utils import get_logger, log_performance
 
@@ -169,6 +169,37 @@ class DocumentProcessor:
         ocr_results = self.reader.readtext(processed_img, detail=0)
         return " ".join(ocr_results).strip()
 
+    @staticmethod
+    def _is_garbled(text: str) -> bool:
+        """
+        Detects if PyMuPDF-extracted text is garbled (font encoding issue).
+
+        WHY THIS CHECK EXISTS:
+          Some PDFs use embedded custom/CID fonts. PyMuPDF extracts text but it
+          comes out as a stream of garbage Unicode characters (not readable ASCII).
+          These pages return non-empty text so the OCR fallback never triggers,
+          but the extracted text is useless for RAG retrieval.
+
+          Example: WHO Guidelines for malaria pages return long strings of
+          characters like \x00, \ufffd, and other non-printable Unicode.
+
+        HOW IT WORKS:
+          If more than 40% of characters in the extracted text are outside the
+          standard printable ASCII range (32-126) and are not standard layout
+          characters (newlines, carriage returns, tabs), we classify the text
+          as garbled and trigger OCR.
+        """
+        if not text or len(text) < 40:
+            return False
+            
+        allowed_spacing = {'\n', '\r', '\t'}
+        non_printable = sum(
+            1 for c in text 
+            if (ord(c) < 32 and c not in allowed_spacing) or ord(c) > 126
+        )
+        ratio = non_printable / len(text)
+        return ratio > 0.40
+
     @log_performance  # Emits overall ingestion latency to logs
     def extract_text(self, file_path: str) -> List[Dict[str, Any]]:
         """
@@ -239,34 +270,53 @@ class DocumentProcessor:
     ) -> List[Dict[str, Any]]:
         """
         Inner method for PDF processing.
-        Separated from extract_text() to keep it readable.
+        Enhanced with thread-safe ThreadPoolExecutor to run page extractions in parallel
+        utilising multiple CPU cores for high-speed OCR ingestion.
         """
         try:
-            doc = fitz.open(file_path)
+            # Quick open to get page count
+            temp_doc = fitz.open(file_path)
+            total_pages = len(temp_doc)
+            temp_doc.close()
         except Exception as e:
             raise ValueError(f"Cannot open PDF '{filename}': {e}")
 
-        pages_data = []
-        total_pages = len(doc)
+        pages_data = [None] * total_pages
         ocr_page_count = 0
+        
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        for page_num, page in enumerate(doc, start=1):
-            ocr_used = False
+        # Thread-local worker function
+        def process_single_page(page_num: int) -> Optional[Dict[str, Any]]:
+            # Each thread opens its own file handle for absolute thread-safety
+            thread_doc = fitz.open(file_path)
             try:
+                page = thread_doc[page_num - 1]
+                ocr_used = False
+                
                 # ── Layer 1: Digital text extraction (fast) ───────────────────
                 page_text = page.get_text().strip()
 
-                if page_text:
-                    # Digital text found — preferred path
+                if page_text and not self._is_garbled(page_text):
+                    # Digital text found AND readable — preferred path
                     pass
                 else:
                     # ── Layer 2: OCR fallback ─────────────────────────────────
-                    logger.info(
-                        f"  Page {page_num}/{total_pages}: no digital text, running OCR..."
-                    )
+                    # Triggered when: page is blank OR digital text is garbled
+                    # (font encoding issue — common in scanned/CID-font PDFs)
+                    if page_text:
+                        logger.warning(
+                            f"  Page {page_num}/{total_pages}: digital text appears garbled "
+                            f"(non-ASCII ratio > 40%). Falling back to OCR..."
+                        )
+                    else:
+                        logger.info(
+                            f"  Page {page_num}/{total_pages}: no digital text, running OCR..."
+                        )
+                    
+                    # Call self.reader (EasyOCR is thread-safe on CPU PyTorch)
                     page_text = self._extract_page_with_ocr(page, scale=2.0)
                     ocr_used = True
-                    ocr_page_count += 1
 
                     # ── OCR Retry at 3x DPI if still empty ───────────────────
                     if not page_text:
@@ -276,32 +326,47 @@ class DocumentProcessor:
                         )
                         page_text = self._extract_page_with_ocr(page, scale=3.0)
 
-                    if not page_text:
-                        logger.warning(
-                            f"  Page {page_num}: OCR returned empty even at 3x. "
-                            "Skipping page."
-                        )
-                        continue  # Skip truly blank/unreadable pages
-
+                if page_text:
+                    return {
+                        "text": page_text,
+                        "metadata": {
+                            "source": filename,
+                            "page": page_num,
+                            "doc_type": "pdf",
+                            "ocr_used": ocr_used,
+                            "char_count": len(page_text)
+                        }
+                    }
+                return None
+                
             except Exception as page_err:
-                # One bad page should never abort the entire document
                 logger.error(
                     f"  Page {page_num}: processing error — {page_err}. Skipping."
                 )
-                continue
+                return None
+            finally:
+                thread_doc.close()
 
-            pages_data.append({
-                "text": page_text,
-                "metadata": {
-                    "source": filename,
-                    "page": page_num,
-                    "doc_type": "pdf",
-                    "ocr_used": ocr_used,
-                    "char_count": len(page_text)
-                }
-            })
+        # Run page extraction in parallel (cap workers to prevent thermal throttling or OOM)
+        max_workers = min(4, os.cpu_count() or 4)
+        logger.info(f"[PARALLEL INGESTION] Extracting {total_pages} pages using {max_workers} threads...")
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_page = {
+                executor.submit(process_single_page, p_num): p_num
+                for p_num in range(1, total_pages + 1)
+            }
+            
+            for future in as_completed(future_to_page):
+                p_num = future_to_page[future]
+                res = future.result()
+                if res:
+                    pages_data[p_num - 1] = res
+                    if res["metadata"]["ocr_used"]:
+                        ocr_page_count += 1
 
-        doc.close()
+        # Filter out None values (skipped pages)
+        pages_data = [p for p in pages_data if p is not None]
 
         # ── Validate we got *something* ───────────────────────────────────────
         if not pages_data:

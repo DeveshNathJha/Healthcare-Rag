@@ -39,11 +39,11 @@ CHANGES MADE vs ORIGINAL:
      for cost tracking in production.
 
 STRICTLY PRESERVED:
-  - /upload endpoint with OCR + Structured data support ✅
-  - /list-files endpoint ✅
-  - /query endpoint with Toggle (target_file) filtering ✅
-  - FlashRank Reranking (via rag.get_response) ✅
-  - QueryRequest / QueryResponse Pydantic models ✅
+  - /upload endpoint with OCR + Structured data support 
+  - /list-files endpoint 
+  - /query endpoint with Toggle (target_file) filtering 
+  - FlashRank Reranking (via rag.get_response) 
+  - QueryRequest / QueryResponse Pydantic models 
 """
 
 import os
@@ -64,6 +64,8 @@ from app.services.table_extractor import convert_pdf_to_excel, validate_with_llm
 
 logger = get_logger(__name__)
 
+from fastapi.middleware.cors import CORSMiddleware
+
 # ── APP INITIALISATION ────────────────────────────────────────────────────────
 app = FastAPI(
     title="Advanced Healthcare RAG System",
@@ -73,6 +75,20 @@ app = FastAPI(
         "ingestion with FAISS vector search, FlashRank reranking, and Llama-3 via Groq."
     ),
     version="3.0.0"  # Bumped: reflects the Small-to-Big + Graph-RAG upgrade
+)
+
+# Enable CORS for frontend connectivity
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ── REQUEST LOGGING MIDDLEWARE ────────────────────────────────────────────────
@@ -109,6 +125,10 @@ class QueryRequest(BaseModel):
     question: str
     # target_file enables Toggle Search — query against a specific document
     target_file: Optional[str] = None
+    # history stores the conversation context for follow-up questions
+    history: Optional[List[dict]] = None
+    # check_relevance triggers the medical relevance gatekeeper agent
+    check_relevance: Optional[bool] = False
 
     @validator("question")
     def question_must_not_be_empty(cls, v):
@@ -133,6 +153,7 @@ class QueryResponse(BaseModel):
     cache_hit:        bool         # True = served from in-memory cache (0 API calls)
     model_used:       Optional[str]  # Which Groq model was selected by ModelRouter
     eval_metrics:     Optional[dict]  # LLM-as-Judge scores (faithfulness, relevance, precision)
+    reformulated_query: Optional[str] = None  # Standing standalone query if reformulated
 
 
 # ── ENDPOINTS ─────────────────────────────────────────────────────────────────
@@ -243,18 +264,18 @@ async def list_files():
 async def query_document(request: QueryRequest):
     """
     Performs context-aware Q&A with Toggle filtering, FlashRank reranking,
-    Small-to-Big context expansion, and Token Optimization.
-
-    CHANGES vs original:
-      - Returns tokens_input + tokens_output (was single tokens_used)
-      - Returns sources list (metadata dicts) for frontend citation rendering
-      - Checks for LLM error in result dict (vs just checking if result is str)
+    Small-to-Big context expansion, Token Optimization, Conversational Memory, and Relevance Gatekeeping.
     """
     try:
-        result = rag.get_response(request.question, request.target_file)
+        result = rag.get_response(
+            query=request.question,
+            target_file=request.target_file,
+            history=request.history,
+            check_relevance=bool(request.check_relevance)
+        )
 
         # Detect error responses from rag_chain (e.g. empty DB, LLM timeout)
-        if result.get("confidence") in ("N/A", "Error"):
+        if result.get("confidence") in ("N/A", "Error") and not result.get("eval_metrics"):
             status = 404 if result["confidence"] == "N/A" else 503
             raise HTTPException(status_code=status, detail=result["answer"])
 
@@ -274,7 +295,8 @@ async def query_document(request: QueryRequest):
             "sources":          result["sources"],
             "cache_hit":        result.get("cache_hit", False),
             "model_used":       result.get("model_used"),
-            "eval_metrics":     result.get("eval_metrics")
+            "eval_metrics":     result.get("eval_metrics"),
+            "reformulated_query": result.get("reformulated_query")
         }
     except HTTPException:
         raise
@@ -334,6 +356,51 @@ async def delete_document(filename: str = Query(..., description="Exact filename
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Deletion failed: {str(e)}")
+
+
+@app.post("/clear-database")
+async def clear_database():
+    """
+    MLOps Admin Endpoint: Clears all uploaded files, deletes the FAISS vector store,
+    clears the parent store, and empties the prompt cache.
+    """
+    try:
+        # 1. Clear uploads folder
+        if os.path.exists(UPLOAD_DIR):
+            for f in os.listdir(UPLOAD_DIR):
+                f_path = os.path.join(UPLOAD_DIR, f)
+                if os.path.isfile(f_path):
+                    try:
+                        os.remove(f_path)
+                    except Exception as e:
+                        logger.warning(f"Failed to delete file {f}: {e}")
+        
+        # 2. Clear FAISS store
+        if os.path.exists(INDEX_PATH):
+            try:
+                shutil.rmtree(INDEX_PATH)
+            except Exception as e:
+                logger.warning(f"Failed to delete FAISS store directory {INDEX_PATH}: {e}")
+            
+        # 3. Reset RAGChain parent stores and vector database references
+        rag.parent_store.clear()
+        rag.vector_store = None
+        
+        # 4. Empty Prompt Cache
+        prompt_cache.clear()
+        
+        # 5. Clear Token Budget Tracker stats in utils
+        token_budget._reset()
+        
+        logger.warning("[RESET] Entire database, vector store, and prompt cache have been cleared.")
+        
+        return {
+            "status": "Success",
+            "message": "Database and vector index cleared successfully."
+        }
+    except Exception as e:
+        logger.error(f"[RESET ERROR] Failed to clear database: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Reset failed: {str(e)}")
 
 
 def remove_file(path: str):

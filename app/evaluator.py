@@ -49,7 +49,7 @@ logger = get_logger(__name__)
 #   Evaluation is a structured yes/no scoring task — it does not need heavy
 #   reasoning. 8B is 10x cheaper and ~3x faster while producing equivalent
 #   scores for binary grounding checks.
-JUDGE_MODEL = "llama-3-8b-8192"
+JUDGE_MODEL = "llama-3.1-8b-instant"
 
 # ── GRADE THRESHOLDS ──────────────────────────────────────────────────────────
 GRADE_THRESHOLDS = {
@@ -217,8 +217,13 @@ class RAGEvaluator:
         t_eval_start = time.perf_counter()
 
         # Truncate context to avoid exceeding judge's context window
-        # WHY 3000 chars: Judge only needs a summary-level view of context, not all 6000 tokens
-        context_for_judge = context[:3000] if len(context) > 3000 else context
+        # WHY 800 chars (not 3000):
+        #   Groq free tier for llama-3.1-8b-instant has a 6000 TPM limit.
+        #   The full prompt (template + question + answer + context) can easily
+        #   hit 8000+ tokens with 3000 chars of context.
+        #   800 chars (~200 tokens) keeps the total well under 4000 tokens,
+        #   giving the judge enough context to score faithfulness and relevance.
+        context_for_judge = context[:800] if len(context) > 800 else context
 
         prompt = JUDGE_PROMPT_TEMPLATE.format(
             question=question,

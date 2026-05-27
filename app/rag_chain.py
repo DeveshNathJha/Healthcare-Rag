@@ -77,6 +77,7 @@ import time
 import hashlib
 import threading
 import tiktoken
+import numpy as np
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
@@ -113,7 +114,7 @@ logger = get_logger(__name__)
 MAX_CONTEXT_TOKENS = 6000
 
 # Model identifiers
-MODEL_LIGHT  = "llama-3-8b-8192"          # Fast, cheap — simple queries
+MODEL_LIGHT  = "llama-3.1-8b-instant"     # Fast, cheap - simple queries
 MODEL_HEAVY  = "llama-3.3-70b-versatile"  # Accurate — diagnostic queries
 
 # ── COMPLEX KEYWORD LIST ──────────────────────────────────────────────────────
@@ -266,6 +267,9 @@ class RAGChain:
         # Without a lock, two simultaneous uploads can corrupt the FAISS index
         # on disk via interleaved save_local calls.
         self._faiss_lock = threading.Lock()
+
+        # In-memory FAISS vector store cache (avoids disk read on every query)
+        self.vector_store = None
 
         # In-memory parent store for Small-to-Big chunking
         # Key: unique chunk ID  Value: parent chunk text
@@ -439,6 +443,7 @@ class RAGChain:
                 vector_store = FAISS.from_documents(all_child_docs, self.embeddings)
 
             vector_store.save_local(self.index_path)
+            self.vector_store = vector_store
 
         logger.info(
             f"[VECTOR STORE] Saved. Total child docs indexed: {len(all_child_docs)}"
@@ -459,30 +464,127 @@ class RAGChain:
             logger.info(f"[LLM] Created ChatGroq instance for model: {model_name}")
         return self._llm_cache[model_name]
 
+    # ── CONVERSATIONAL MEMORY & RELEVANCE GATEKEEPER ──────────────────────────
+    def reformulate_query(self, query: str, history: List[Dict[str, str]]) -> str:
+        """
+        Reformulates follow-up queries using history.
+        Uses llama-3.1-8b-instant since it is extremely fast and perfect for structural rewriting.
+        """
+        history_str = ""
+        for msg in history:
+            role = "User" if msg.get("role") == "user" else "AI"
+            history_str += f"{role}: {msg.get('content')}\n"
+
+        prompt_template = """Given the conversation history and a follow-up question, rewrite the follow-up question to be a standalone question that contains all necessary context from history. Do NOT answer the question, just rewrite it.
+If the follow-up question does not need rewriting (e.g. it is already a standalone question), return the original question exactly as it is.
+
+=== CONVERSATION HISTORY ===
+{history}
+
+=== FOLLOW-UP QUESTION ===
+{question}
+
+=== STANDALONE QUESTION ===
+"""
+        prompt = prompt_template.format(history=history_str, question=query)
+        try:
+            llm = self._get_llm(MODEL_LIGHT)
+            response = llm.invoke(prompt)
+            standalone = response.content.strip()
+            # Clean up potential quotes
+            if standalone.startswith('"') and standalone.endswith('"'):
+                standalone = standalone[1:-1]
+            logger.info(f"[MEM] Reformulated: '{query}' -> '{standalone}'")
+            return standalone
+        except Exception as e:
+            logger.warning(f"[MEM] Reformulation failed: {e}. Falling back to original query.")
+            return query
+
+    def is_query_relevant(self, query: str) -> Dict[str, Any]:
+        """
+        Checks if the query is relevant to a healthcare database or if it is out-of-scope/chit-chat.
+        Returns a dict: {"relevant": bool, "explanation": str}
+        """
+        prompt_template = """You are a gatekeeper for a professional medical document database. Evaluate whether the user's query is clinically or medically relevant, or standard greeting, or completely out-of-scope chit-chat.
+
+User Query: "{query}"
+
+Instructions:
+- If the query is related to health, medicine, clinical findings, patients, guidelines, biology, diseases, drugs, or asking for help with a medical report, it is RELEVANT.
+- If the query is general greeting (e.g. "hi", "hello", "how are you"), it is RELEVANT (we allow greetings).
+- If the query is completely unrelated (e.g. "who won the game", "recommend a movie", "write a python script", "weather today"), it is IRRELEVANT.
+
+Return ONLY a valid JSON object:
+{{"relevant": true/false, "explanation": "Brief explanation"}}"""
+        
+        try:
+            llm = self._get_llm(MODEL_LIGHT)
+            response = llm.invoke(prompt_template.format(query=query))
+            raw_text = response.content.strip()
+            
+            import json
+            import re
+            cleaned = re.sub(r"```(?:json)?", "", raw_text).strip().rstrip("`").strip()
+            data = json.loads(cleaned)
+            return {
+                "relevant": bool(data.get("relevant", True)),
+                "explanation": str(data.get("explanation", ""))
+            }
+        except Exception as e:
+            logger.warning(f"[RELEVANCE] Check failed: {e}. Defaulting to relevant.")
+            return {"relevant": True, "explanation": "Fallback"}
+
     # ── QUERY & RETRIEVAL ─────────────────────────────────────────────────────
     def get_response(
-        self, query: str, target_file: Optional[str] = None
+        self,
+        query: str,
+        target_file: Optional[str] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+        check_relevance: bool = False
     ) -> Dict[str, Any]:
         """
-        Full pipeline: Cache check → FAISS retrieval → FlashRank reranking →
-        Small-to-Big expansion → Model routing → Groq LLM generation → LLM-as-Judge eval.
+        Full pipeline: Relevance check → Query Reformulation → Cache check → FAISS retrieval →
+        FlashRank reranking → Small-to-Big expansion → Model routing → Groq LLM generation → LLM-as-Judge eval.
 
         Toggle logic: if target_file is set, search only within that document's
         chunks via FAISS metadata filter. (UNCHANGED FEATURE)
-
-        CHANGES vs original:
-          - Prompt cache: returns instantly on repeat queries (0 API calls)
-          - Multi-factor model router: llama-3-8b-8192 vs llama-3.3-70b-versatile
-          - LLM-as-Judge: RAGEvaluator scores faithfulness/relevance/precision
-          - Logs latency for each phase (FAISS, rerank, LLM, eval)
-          - Expands child chunks to parent chunks before LLM call
-          - Trims context if it exceeds MAX_CONTEXT_TOKENS
-          - Counts both input AND output tokens
-          - Extracts page-level citations from metadata
-          - Catches Groq API timeouts gracefully
         """
-        # ── Phase 0: Prompt Cache Check ───────────────────────────────────────
-        cached = prompt_cache.get(query, target_file)
+        # ── Phase 0.1: Optional Relevance Gatekeeper ─────────────────────────
+        if check_relevance:
+            relevance = self.is_query_relevant(query)
+            if not relevance["relevant"]:
+                logger.info(f"[RELEVANCE] Out-of-scope query rejected: '{query}' ({relevance['explanation']})")
+                return {
+                    "answer": (
+                        "I'm sorry, but that question is outside the scope of our clinical documents library. "
+                        "Please ask a medical or health-related question, or upload a document containing the relevant information."
+                    ),
+                    "tokens_input": 0,
+                    "tokens_output": 0,
+                    "confidence": "Low (Rejected by Relevance Gatekeeper)",
+                    "sources": [],
+                    "cache_hit": False,
+                    "model_used": None,
+                    "eval_metrics": {
+                        "faithfulness": 0.0,
+                        "answer_relevance": 0.0,
+                        "context_precision": 0.0,
+                        "eval_grade": "F",
+                        "judge_model": "N/A",
+                        "eval_latency_ms": 0.0
+                    },
+                    "reformulated_query": None
+                }
+
+        # ── Phase 0.2: Conversational Memory (Query Reformulation) ────────────
+        reformulated_query = query
+        if history and len(history) > 0:
+            logger.info(f"[MEM] History provided (len={len(history)}). Triggering query reformulation...")
+            reformulated_query = self.reformulate_query(query, history)
+
+        # ── Phase 0.3: Prompt Cache Check ─────────────────────────────────────
+        # Note: Cache on reformulated query ensures consistency
+        cached = prompt_cache.get(reformulated_query, target_file)
         if cached is not None:
             # Return cached response with cache_hit flag set
             cached_response = dict(cached)
@@ -493,6 +595,7 @@ class RAGChain:
                 model_used=cached_response.get("model_used", MODEL_HEAVY),
                 cache_hit=True
             )
+            cached_response["reformulated_query"] = reformulated_query if reformulated_query != query else None
             return cached_response
 
         # Check if index exists and contains the necessary files
@@ -505,63 +608,78 @@ class RAGChain:
                 "sources": [],
                 "cache_hit": False,
                 "model_used": None,
-                "eval_metrics": None
+                "eval_metrics": None,
+                "reformulated_query": reformulated_query if reformulated_query != query else None
             }
 
         # ── Phase 1: FAISS Retrieval ──────────────────────────────────────────
         t0 = time.perf_counter()
-        with self._faiss_lock:
-            vector_store = FAISS.load_local(
-                self.index_path,
-                self.embeddings,
-                allow_dangerous_deserialization=True
-            )
+        if not os.path.exists(self.index_path) or not os.path.exists(os.path.join(self.index_path, "index.faiss")):
+            logger.warning("[RETRIEVAL] FAISS index directory does not exist on disk.")
+            self.vector_store = None
+            return {
+                "answer": "No indexed medical records found in the database. Please upload clinical documents first to populate the vector index.",
+                "tokens_input": 0,
+                "tokens_output": 0,
+                "confidence": "N/A",
+                "sources": [],
+                "cache_hit": False,
+                "model_used": None,
+                "eval_metrics": None,
+                "reformulated_query": reformulated_query if reformulated_query != query else None
+            }
+
+        if self.vector_store is None:
+            logger.info("[RETRIEVAL] FAISS index not loaded in memory. Loading from disk...")
+            with self._faiss_lock:
+                self.vector_store = FAISS.load_local(
+                    self.index_path,
+                    self.embeddings,
+                    allow_dangerous_deserialization=True
+                )
+        else:
+            logger.info("[RETRIEVAL] Using cached in-memory FAISS index.")
 
         # Retrieve top-10 child chunks; apply Toggle filter if target_file set
         search_kwargs = {"k": 10}
         if target_file:
             search_kwargs["filter"] = {"source": target_file}
 
-        base_retriever = vector_store.as_retriever(search_kwargs=search_kwargs)
+        base_retriever = self.vector_store.as_retriever(search_kwargs=search_kwargs)
         t1 = time.perf_counter()
-        logger.info(f"[RETRIEVAL] FAISS load+setup: {(t1-t0)*1000:.1f}ms")
+        logger.info(f"[RETRIEVAL] FAISS setup: {(t1-t0)*1000:.1f}ms")
 
-        # ── Phase 2: FlashRank Reranking (UNCHANGED FEATURE — with Offline Fallback) ──
+        # ── Phase 2: FlashRank Reranking ──────────────────────────────────────
         t2 = time.perf_counter()
         if self.compressor:
             compression_retriever = ContextualCompressionRetriever(
                 base_compressor=self.compressor,
                 base_retriever=base_retriever
             )
-            # Retrieve and rerank
-            reranked_docs = compression_retriever.invoke(query)
+            # Retrieve and rerank using reformulated query for maximum precision
+            reranked_docs = compression_retriever.invoke(reformulated_query)
             logger.info(
                 f"[RETRIEVAL] FlashRank reranking: {(time.perf_counter()-t2)*1000:.1f}ms | "
                 f"docs_returned={len(reranked_docs)}"
             )
         else:
             # Fallback: use base_retriever directly if Flashrank is unavailable
-            reranked_docs = base_retriever.invoke(query)
+            reranked_docs = base_retriever.invoke(reformulated_query)
             logger.info(
                 f"[RETRIEVAL] FlashRank SKIPPED (offline/failed init): {(time.perf_counter()-t2)*1000:.1f}ms | "
                 f"docs_returned={len(reranked_docs)}"
             )
 
         # ── Small-to-Big: Expand child chunks to parent context ───────────────
-        # WHY: The child chunk (≤400 chars) was retrieved for precision.
-        # The parent chunk (≤1500 chars) provides the LLM with surrounding
-        # clinical context, improving answer quality.
         expanded_docs = []
         for doc in reranked_docs:
             parent_id = doc.metadata.get("parent_id")
             if parent_id and parent_id in self.parent_store:
-                # Use parent text; keep child's metadata for citations
                 expanded_text = self.parent_store[parent_id]
                 expanded_docs.append(
                     Document(page_content=expanded_text, metadata=doc.metadata)
                 )
             else:
-                # Fallback: parent not in memory (e.g. after server restart)
                 expanded_docs.append(doc)
 
         # ── Token guard: trim if context exceeds Groq's context window ────────
@@ -574,13 +692,21 @@ class RAGChain:
         metadata_list = []
         for doc in expanded_docs:
             context_parts.append(doc.page_content)
-            metadata_list.append(doc.metadata)
+            cleaned_meta = {}
+            for k, v in doc.metadata.items():
+                if hasattr(v, "item"):
+                    cleaned_meta[k] = v.item()
+                elif isinstance(v, (np.float32, np.float64, np.int64)):
+                    cleaned_meta[k] = float(v) if "float" in str(type(v)) else int(v)
+                else:
+                    cleaned_meta[k] = v
+            metadata_list.append(cleaned_meta)
 
         context_str = "\n\n---\n\n".join(context_parts)
-        citations_str = format_citations(metadata_list)  # Uses enhanced utils.py
+        citations_str = format_citations(metadata_list)
 
-        # Count INPUT tokens (query + context) for cost tracking
-        input_text = f"{query}\n{context_str}"
+        # Count INPUT tokens (reformulated query + context) for cost tracking
+        input_text = f"{reformulated_query}\n{context_str}"
         tokens_input = self.count_tokens(input_text)
         logger.info(
             f"[TOKEN OPT] Input tokens (query+context): {tokens_input} / "
@@ -588,10 +714,6 @@ class RAGChain:
         )
 
         # ── Phase 3: Prompt Engineering with Page-Level Citations ─────────────
-        # WHY this template:
-        #   - Explicit "if answer is missing" guard prevents hallucinations
-        #   - Source citations embedded in prompt so LLM can reference them
-        #   - Clinical tone appropriate for medical staff use-case
         template = """You are a Senior Medical AI Assistant. Analyze the medical \
 documents from the healthcare system and answer accurately based ONLY on the \
 provided context. If the answer is not found in the context, clearly state that the \
@@ -615,9 +737,7 @@ Answer:"""
         prompt = PromptTemplate.from_template(template)
 
         # ── Phase 3.5: Model Router ───────────────────────────────────────────
-        # WHY after token counting: select_model() uses tokens_input as a signal.
-        # Only possible to call after FAISS + expansion + trimming are done.
-        model_name = select_model(query, tokens_input)
+        model_name = select_model(reformulated_query, tokens_input)
         llm = self._get_llm(model_name)
 
         # ── Phase 4: LLM Generation (Groq Llama-3) ───────────────────────────
@@ -633,11 +753,10 @@ Answer:"""
                 | llm
                 | StrOutputParser()
             )
-            response_text = rag_chain.invoke(query)
+            # Answer the reformulated question to keep context grounding 100% precise
+            response_text = rag_chain.invoke(reformulated_query)
 
         except Exception as exc:
-            # Catches Groq API timeouts, rate limits, and network errors
-            # WHY: Surface a structured error rather than a 500 crash
             err_type = type(exc).__name__
             logger.error(f"[LLM ERROR] {err_type}: {exc}")
             return {
@@ -651,7 +770,8 @@ Answer:"""
                 "sources":       metadata_list,
                 "cache_hit":     False,
                 "model_used":    model_name,
-                "eval_metrics":  None
+                "eval_metrics":  None,
+                "reformulated_query": reformulated_query if reformulated_query != query else None
             }
 
         t5 = time.perf_counter()
@@ -661,10 +781,8 @@ Answer:"""
         tokens_output = self.count_tokens(response_text)
 
         # ── Phase 5: LLM-as-Judge Evaluation ─────────────────────────────────
-        # WHY after generation: We need the actual answer to evaluate.
-        # WHY not blocking: If evaluator fails, query result is still returned.
         eval_metrics = self.evaluator.evaluate(
-            question=query,
+            question=reformulated_query,
             context=context_str,
             answer=response_text
         )
@@ -694,10 +812,11 @@ Answer:"""
             "sources":       metadata_list,
             "cache_hit":     False,
             "model_used":    model_name,
-            "eval_metrics":  eval_metrics
+            "eval_metrics":  eval_metrics,
+            "reformulated_query": reformulated_query if reformulated_query != query else None
         }
 
         # ── Store in cache for future repeat queries ───────────────────────────
-        prompt_cache.set(query, target_file, final_result)
+        prompt_cache.set(reformulated_query, target_file, final_result)
 
         return final_result

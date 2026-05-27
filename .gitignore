@@ -50,6 +50,10 @@ uploads/
 logs/
 *.log
 notes/
+*.pdf
+*.html
+*.doc
+*.docx
 
 # Models/Weights
 *.pt
